@@ -48,10 +48,20 @@ def _ensure_files():
             hash TEXT NOT NULL,
             is_admin INTEGER NOT NULL,
             active INTEGER NOT NULL,
-            verified INTEGER NOT NULL
+            verified INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            parent TEXT NOT NULL DEFAULT '',
+            portfolio TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "role" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+    if "parent" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN parent TEXT NOT NULL DEFAULT ''")
+    if "portfolio" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN portfolio TEXT NOT NULL DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -113,13 +123,19 @@ def seed_admin():
         if row is None:
             salt = uuid.uuid4().hex
             conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, 1, 1, 1)",
+                """
+                INSERT INTO users (username, email, salt, hash, is_admin, active, verified, role, parent, portfolio)
+                VALUES (?, ?, ?, ?, 1, 1, 1, 'owner', '', '10000.00')
+                """,
                 (ADMIN_USER, ADMIN_EMAIL, salt, _hash_password(ADMIN_PASS, salt)),
             )
             conn.commit()
         else:
             conn.execute(
-                "UPDATE users SET is_admin = 1, active = 1, verified = 1 WHERE username = ?",
+                """
+                UPDATE users SET is_admin = 1, active = 1, verified = 1, role = 'owner'
+                WHERE username = ? COLLATE NOCASE
+                """,
                 (ADMIN_USER,),
             )
             conn.commit()
@@ -154,6 +170,114 @@ def _gh_headers():
     }
 
 
+def _is_founder(username):
+    return (username or "").strip().lower() == ADMIN_USER.lower()
+
+
+def _row_get(row, key, default=""):
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    if value is None:
+        return default
+    return value
+
+
+def _role_of(row):
+    if _is_founder(_row_get(row, "username")):
+        return "owner"
+    role = str(_row_get(row, "role") or "").strip().lower()
+    if role in ("owner", "partner", "user"):
+        return role
+    if _row_get(row, "is_admin"):
+        return "owner"
+    return "user"
+
+
+def _is_staff(row):
+    return _role_of(row) in ("owner", "partner")
+
+
+def _is_owner(row):
+    return _role_of(row) == "owner"
+
+
+def _normalize_role(role, default="user"):
+    value = str(role or default).strip().lower()
+    if value not in ("owner", "partner", "user"):
+        raise ValueError("Rol no válido.")
+    return value
+
+
+def _normalize_portfolio(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return ""
+    try:
+        amount = float(text)
+    except ValueError:
+        raise ValueError("El valor de cartera no es válido.")
+    if amount < 0 or amount > 1000000000:
+        raise ValueError("El valor de cartera no es válido.")
+    return "%.2f" % amount
+
+
+def _insert_user(conn, user):
+    role = str(user.get("role") or "").strip().lower()
+    if _is_founder(user.get("username")):
+        role = "owner"
+    elif role not in ("owner", "partner", "user"):
+        role = "owner" if int(user.get("is_admin") or 0) else "user"
+    staff = 1 if role in ("owner", "partner") else 0
+    conn.execute(
+        """
+        INSERT INTO users (username, email, salt, hash, is_admin, active, verified, role, parent, portfolio)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user["username"],
+            user["email"],
+            user["salt"],
+            user["hash"],
+            staff,
+            int(user.get("active") if user.get("active") is not None else 1),
+            int(user.get("verified") if user.get("verified") is not None else 1),
+            role,
+            str(user.get("parent") or ""),
+            str(user.get("portfolio") or ""),
+        ),
+    )
+
+
+def _children(conn, parent):
+    return conn.execute(
+        "SELECT * FROM users WHERE parent = ? COLLATE NOCASE ORDER BY username COLLATE NOCASE",
+        (parent,),
+    ).fetchall()
+
+
+def _can_see(actor, target):
+    if _is_owner(actor):
+        return True
+    actor_name = actor["username"]
+    if target["username"].lower() == actor_name.lower():
+        return True
+    return str(_row_get(target, "parent")).lower() == actor_name.lower()
+
+
+def _can_manage(actor, target):
+    if _is_founder(target["username"]):
+        return False
+    if _is_owner(actor):
+        return True
+    if _role_of(actor) != "partner":
+        return False
+    return str(_row_get(target, "parent")).lower() == actor["username"].lower()
+
+
 def _snapshot():
     conn = db()
     users = [{key: row[key] for key in row.keys()} for row in conn.execute("SELECT * FROM users")]
@@ -176,18 +300,7 @@ def _apply_snapshot(data):
     conn = db()
     conn.execute("DELETE FROM users")
     for user in users:
-        conn.execute(
-            "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                user["username"],
-                user["email"],
-                user["salt"],
-                user["hash"],
-                int(user.get("is_admin") or 0),
-                int(user.get("active") if user.get("active") is not None else 1),
-                int(user.get("verified") if user.get("verified") is not None else 1),
-            ),
-        )
+        _insert_user(conn, user)
     conn.commit()
     conn.close()
 
@@ -238,12 +351,17 @@ def _normalize_url(url):
 
 
 def user_public(row):
+    role = _role_of(row)
     return {
         "username": row["username"],
         "email": row["email"],
         "verified": bool(row["verified"]),
-        "isAdmin": bool(row["is_admin"]),
+        "isAdmin": role in ("owner", "partner"),
         "active": bool(row["active"]),
+        "role": role,
+        "parent": str(_row_get(row, "parent") or ""),
+        "portfolio": str(_row_get(row, "portfolio") or ""),
+        "founder": _is_founder(row["username"]),
     }
 
 
@@ -292,8 +410,17 @@ class Handler(BaseHTTPRequestHandler):
         return row
 
     def _require_admin(self):
+        return self._require_staff()
+
+    def _require_staff(self):
         row = self._require_user()
-        if row is None or not row["is_admin"]:
+        if row is None or not _is_staff(row):
+            return None
+        return row
+
+    def _require_owner(self):
+        row = self._require_user()
+        if row is None or not _is_owner(row):
             return None
         return row
 
@@ -318,15 +445,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"user": user_public(row)})
             return
         if path == "/admin/users":
-            if self._require_admin() is None:
-                self._json(403, {"error": "Solo el administrador puede gestionar cuentas."})
+            actor = self._require_staff()
+            if actor is None:
+                self._json(403, {"error": "No tienes permiso para gestionar cuentas."})
                 return
             conn = db()
-            rows = conn.execute(
-                "SELECT * FROM users ORDER BY is_admin DESC, username COLLATE NOCASE"
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM users ORDER BY username COLLATE NOCASE").fetchall()
             conn.close()
-            self._json(200, {"users": [user_public(r) for r in rows]})
+            if _is_owner(actor):
+                visible = [user_public(r) for r in rows]
+            else:
+                visible = [
+                    user_public(r)
+                    for r in rows
+                    if str(_row_get(r, "parent")).lower() == actor["username"].lower()
+                ]
+            self._json(200, {"users": visible})
             return
         self._json(404, {"error": "No encontrado."})
 
@@ -353,8 +487,8 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/admin/config":
             self._json(404, {"error": "No encontrado."})
             return
-        if self._require_admin() is None:
-            self._json(403, {"error": "Solo el administrador puede gestionar cuentas."})
+        if self._require_owner() is None:
+            self._json(403, {"error": "Solo un propietario puede cambiar el contacto."})
             return
         try:
             body = self._body()
@@ -374,8 +508,9 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/admin/users":
             self._json(404, {"error": "No encontrado."})
             return
-        if self._require_admin() is None:
-            self._json(403, {"error": "Solo el administrador puede gestionar cuentas."})
+        actor = self._require_staff()
+        if actor is None:
+            self._json(403, {"error": "No tienes permiso para gestionar cuentas."})
             return
         try:
             body = self._body()
@@ -383,27 +518,67 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "JSON inválido."})
             return
         username = (body.get("username") or "").strip()
-        active = body.get("active")
-        if not username or not isinstance(active, bool):
+        if not username:
             self._json(400, {"error": "Usuario o estado no válido."})
-            return
-        if username.lower() == ADMIN_USER.lower():
-            self._json(400, {"error": "No puedes desactivar la cuenta admin."})
             return
         with _lock:
             conn = db()
-            cur = conn.execute(
-                "UPDATE users SET active = ? WHERE username = ? COLLATE NOCASE",
-                (1 if active else 0, username),
+            target = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
+            if target is None:
+                conn.close()
+                self._json(404, {"error": "Usuario no encontrado."})
+                return
+            if not _can_manage(actor, target):
+                conn.close()
+                self._json(403, {"error": "No puedes gestionar esa cuenta."})
+                return
+            fields = []
+            values = []
+            if "active" in body:
+                if not isinstance(body.get("active"), bool):
+                    conn.close()
+                    self._json(400, {"error": "Usuario o estado no válido."})
+                    return
+                fields.append("active = ?")
+                values.append(1 if body["active"] else 0)
+            if "portfolio" in body:
+                try:
+                    portfolio = _normalize_portfolio(body.get("portfolio"))
+                except ValueError as exc:
+                    conn.close()
+                    self._json(400, {"error": str(exc)})
+                    return
+                fields.append("portfolio = ?")
+                values.append(portfolio)
+            if "role" in body:
+                if not _is_owner(actor):
+                    conn.close()
+                    self._json(403, {"error": "Solo un propietario puede asignar roles."})
+                    return
+                try:
+                    role = _normalize_role(body.get("role"))
+                except ValueError as exc:
+                    conn.close()
+                    self._json(400, {"error": str(exc)})
+                    return
+                fields.append("role = ?")
+                values.append(role)
+                fields.append("is_admin = ?")
+                values.append(1 if role in ("owner", "partner") else 0)
+            if not fields:
+                conn.close()
+                self._json(400, {"error": "Usuario o estado no válido."})
+                return
+            values.append(username)
+            conn.execute(
+                "UPDATE users SET %s WHERE username = ? COLLATE NOCASE" % ", ".join(fields),
+                values,
             )
             conn.commit()
-            changed = cur.rowcount
             conn.close()
-            if changed:
-                persist()
-        if not changed:
-            self._json(404, {"error": "Usuario no encontrado."})
-            return
+            persist()
         self._json(200, {"ok": True})
 
     def do_DELETE(self):
@@ -411,8 +586,9 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/admin/users":
             self._json(404, {"error": "No encontrado."})
             return
-        if self._require_admin() is None:
-            self._json(403, {"error": "Solo el administrador puede gestionar cuentas."})
+        actor = self._require_staff()
+        if actor is None:
+            self._json(403, {"error": "No tienes permiso para gestionar cuentas."})
             return
         try:
             body = self._body()
@@ -423,20 +599,23 @@ class Handler(BaseHTTPRequestHandler):
         if not username:
             self._json(400, {"error": "Usuario no encontrado."})
             return
-        if username.lower() == ADMIN_USER.lower():
-            self._json(400, {"error": "No puedes eliminar la cuenta admin."})
-            return
         with _lock:
             conn = db()
-            cur = conn.execute("DELETE FROM users WHERE username = ? COLLATE NOCASE", (username,))
+            target = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
+            if target is None:
+                conn.close()
+                self._json(404, {"error": "Usuario no encontrado."})
+                return
+            if not _can_manage(actor, target):
+                conn.close()
+                self._json(403, {"error": "No puedes eliminar esa cuenta."})
+                return
+            conn.execute("DELETE FROM users WHERE username = ? COLLATE NOCASE", (username,))
             conn.commit()
-            changed = cur.rowcount
             conn.close()
-            if changed:
-                persist()
-        if not changed:
-            self._json(404, {"error": "Usuario no encontrado."})
-            return
+            persist()
         self._json(200, {"ok": True})
 
     def _login(self, body):
@@ -457,8 +636,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"token": token, "user": user_public(row)})
 
     def _create(self, body):
-        if self._require_admin() is None:
-            self._json(403, {"error": "Solo el administrador puede crear cuentas."})
+        actor = self._require_staff()
+        if actor is None:
+            self._json(403, {"error": "No tienes permiso para crear cuentas."})
             return
         username = (body.get("username") or "").strip()
         email = (body.get("email") or "").strip()
@@ -471,6 +651,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             _validate_password(password)
+            portfolio = _normalize_portfolio(body.get("portfolio") if "portfolio" in body else "")
+            if _is_owner(actor):
+                role = _normalize_role(body.get("role") or "user")
+            else:
+                role = "user"
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
             return
@@ -478,6 +663,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "No puedes crear otro usuario admin."})
             return
         salt = uuid.uuid4().hex
+        parent = actor["username"]
+        staff = 1 if role in ("owner", "partner") else 0
         with _lock:
             conn = db()
             exists = conn.execute(
@@ -488,17 +675,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(409, {"error": "Ese usuario ya existe."})
                 return
             conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, 0, 1, 1)",
-                (username, email, salt, _hash_password(password, salt)),
+                """
+                INSERT INTO users (username, email, salt, hash, is_admin, active, verified, role, parent, portfolio)
+                VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+                """,
+                (username, email, salt, _hash_password(password, salt), staff, role, parent, portfolio or ""),
             )
             conn.commit()
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
             conn.close()
             persist()
-        self._json(201, {"user": {"username": username, "email": email, "verified": True, "isAdmin": False, "active": True}})
+        self._json(201, {"user": user_public(row)})
 
     def _reset(self, body):
-        if self._require_admin() is None:
-            self._json(403, {"error": "Solo el administrador puede gestionar cuentas."})
+        actor = self._require_staff()
+        if actor is None:
+            self._json(403, {"error": "No tienes permiso para gestionar cuentas."})
             return
         username = (body.get("username") or "").strip()
         password = body.get("password") or ""
@@ -507,24 +701,27 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
             return
-        if username.lower() == ADMIN_USER.lower():
-            self._json(400, {"error": "Cambia la contraseña admin desde otro flujo."})
-            return
-        salt = uuid.uuid4().hex
         with _lock:
             conn = db()
-            cur = conn.execute(
+            target = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
+            if target is None:
+                conn.close()
+                self._json(404, {"error": "Usuario no encontrado."})
+                return
+            if not _can_manage(actor, target):
+                conn.close()
+                self._json(403, {"error": "No puedes cambiar esa contraseña."})
+                return
+            salt = uuid.uuid4().hex
+            conn.execute(
                 "UPDATE users SET salt = ?, hash = ? WHERE username = ? COLLATE NOCASE",
                 (salt, _hash_password(password, salt), username),
             )
             conn.commit()
-            changed = cur.rowcount
             conn.close()
-            if changed:
-                persist()
-        if not changed:
-            self._json(404, {"error": "Usuario no encontrado."})
-            return
+            persist()
         self._json(200, {"ok": True})
 
 
