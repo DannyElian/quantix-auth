@@ -2,10 +2,7 @@
 
 Las cuentas viven en este servicio. El administrador crea usuarios y cualquier teléfono puede entrar.
 
-Acceso inicial:
-
-- Usuario: `admin`
-- Contraseña: `QuantixAdmin1`
+El administrador entra con las credenciales definidas en las variables de entorno `ADMIN_USERNAME` y `ADMIN_PASSWORD`.
 
 El plan gratuito de Render se duerme a los 15 minutos sin tráfico. El primer login puede tardar hasta un minuto. Un ping cada 10 minutos (GitHub Actions) intenta mantenerlo despierto.
 

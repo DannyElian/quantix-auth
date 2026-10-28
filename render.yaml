@@ -12,10 +12,10 @@ services:
       - key: PORT
         value: "8787"
       - key: GIST_ID
-        value: 4625c96548b90d08e42996979c279efa
+        sync: false
       - key: GITHUB_TOKEN
         sync: false
       - key: ADMIN_USERNAME
         value: admin
       - key: ADMIN_PASSWORD
-        value: QuantixAdmin1
+        sync: false
