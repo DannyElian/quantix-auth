@@ -212,7 +212,9 @@ def _is_owner(row):
 
 def _normalize_role(role, default="user"):
     value = str(role or default).strip().lower()
-    if value not in ("owner", "partner", "user"):
+    if value == "owner":
+        raise ValueError("No se puede asignar el rol de propietario.")
+    if value not in ("partner", "user"):
         raise ValueError("Rol no válido.")
     return value
 
