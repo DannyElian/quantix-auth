@@ -26,7 +26,7 @@ ADMIN_USER = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASSWORD", "QuantixAdmin1")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@quantix.app")
 TOKEN_HOURS = 12
-GIST_ID = os.environ.get("GIST_ID", "4625c96548b90d08e42996979c279efa").strip()
+GIST_ID = os.environ.get("GIST_ID", "").strip()
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GIST_FILE = "quantix-store.json"
 
