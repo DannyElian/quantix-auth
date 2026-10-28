@@ -142,17 +142,24 @@ def seed_admin():
         conn.close()
 
 
+def _empty_settings():
+    return {"contactUrl": "", "signupUrl": ""}
+
+
 def _load_settings():
     if not os.path.isfile(SETTINGS_PATH):
-        return {"contactUrl": ""}
+        return _empty_settings()
     try:
         with open(SETTINGS_PATH) as f:
             data = json.load(f)
     except Exception:
-        return {"contactUrl": ""}
+        return _empty_settings()
     if not isinstance(data, dict):
-        return {"contactUrl": ""}
-    return {"contactUrl": str(data.get("contactUrl") or "").strip()}
+        return _empty_settings()
+    return {
+        "contactUrl": str(data.get("contactUrl") or "").strip(),
+        "signupUrl": str(data.get("signupUrl") or data.get("iqOptionUrl") or "").strip(),
+    }
 
 
 def _save_settings(settings):
@@ -495,10 +502,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "JSON inválido."})
             return
-        url = _normalize_url(body.get("contactUrl") or "")
         with _lock:
             settings = _load_settings()
-            settings["contactUrl"] = url
+            if "contactUrl" in body:
+                settings["contactUrl"] = _normalize_url(body.get("contactUrl") or "")
+            if "signupUrl" in body or "iqOptionUrl" in body:
+                settings["signupUrl"] = _normalize_url(body.get("signupUrl") or body.get("iqOptionUrl") or "")
             _save_settings(settings)
             persist()
         self._json(200, settings)
