@@ -119,17 +119,21 @@ def db():
 def seed_admin():
     with _lock:
         conn = db()
-        row = conn.execute("SELECT username FROM users WHERE username = ?", (ADMIN_USER,)).fetchone()
+        row = conn.execute(
+            "SELECT username FROM users WHERE username = ? COLLATE NOCASE", (ADMIN_USER,)
+        ).fetchone()
         if row is None:
-            salt = uuid.uuid4().hex
-            conn.execute(
-                """
-                INSERT INTO users (username, email, salt, hash, is_admin, active, verified, role, parent, portfolio)
-                VALUES (?, ?, ?, ?, 1, 1, 1, 'owner', '', '10000.00')
-                """,
-                (ADMIN_USER, ADMIN_EMAIL, salt, _hash_password(ADMIN_PASS, salt)),
-            )
-            conn.commit()
+            existing = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            if existing is None:
+                salt = uuid.uuid4().hex
+                conn.execute(
+                    """
+                    INSERT INTO users (username, email, salt, hash, is_admin, active, verified, role, parent, portfolio)
+                    VALUES (?, ?, ?, ?, 1, 1, 1, 'owner', '', '10000.00')
+                    """,
+                    (ADMIN_USER, ADMIN_EMAIL, salt, _hash_password(ADMIN_PASS, salt)),
+                )
+                conn.commit()
         else:
             conn.execute(
                 """
@@ -215,6 +219,35 @@ def _normalize_role(role, default="user"):
     if value not in ("owner", "partner", "user"):
         raise ValueError("Rol no válido.")
     return value
+
+
+def _validate_username(username):
+    name = (username or "").strip()
+    if len(name) < 3:
+        raise ValueError("El usuario debe tener al menos 3 caracteres.")
+    if len(name) > 32:
+        raise ValueError("El usuario no puede tener más de 32 caracteres.")
+    return name
+
+
+def _rename_user(conn, old_name, new_name):
+    if old_name == new_name:
+        return new_name
+    clash = conn.execute(
+        "SELECT username FROM users WHERE username = ? COLLATE NOCASE",
+        (new_name,),
+    ).fetchone()
+    if clash is not None and clash["username"].lower() != old_name.lower():
+        raise ValueError("Ese usuario ya existe.")
+    conn.execute(
+        "UPDATE users SET username = ? WHERE username = ? COLLATE NOCASE",
+        (new_name, old_name),
+    )
+    conn.execute(
+        "UPDATE users SET parent = ? WHERE parent = ? COLLATE NOCASE",
+        (new_name, old_name),
+    )
+    return new_name
 
 
 def _normalize_portfolio(value):
@@ -410,7 +443,9 @@ class Handler(BaseHTTPRequestHandler):
         if not username:
             return None
         conn = db()
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+        ).fetchone()
         conn.close()
         if row is None or not row["active"]:
             return None
@@ -514,17 +549,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = self.path.split("?", 1)[0]
+        try:
+            body = self._body()
+        except Exception:
+            self._json(400, {"error": "JSON inválido."})
+            return
+        if path == "/auth/me":
+            self._rename_self(body)
+            return
         if path != "/admin/users":
             self._json(404, {"error": "No encontrado."})
             return
         actor = self._require_staff()
         if actor is None:
             self._json(403, {"error": "No tienes permiso para gestionar cuentas."})
-            return
-        try:
-            body = self._body()
-        except Exception:
-            self._json(400, {"error": "JSON inválido."})
             return
         username = (body.get("username") or "").strip()
         if not username:
@@ -545,6 +583,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             fields = []
             values = []
+            new_name = None
+            if body.get("newUsername") is not None:
+                try:
+                    new_name = _validate_username(body.get("newUsername"))
+                except ValueError as exc:
+                    conn.close()
+                    self._json(400, {"error": str(exc)})
+                    return
             if "active" in body:
                 if not isinstance(body.get("active"), bool):
                     conn.close()
@@ -562,6 +608,10 @@ class Handler(BaseHTTPRequestHandler):
                 fields.append("portfolio = ?")
                 values.append(portfolio)
             if "role" in body:
+                if target["username"].lower() == actor["username"].lower():
+                    conn.close()
+                    self._json(403, {"error": "No puedes cambiarte el rol a ti mismo."})
+                    return
                 if not _is_owner(actor):
                     conn.close()
                     self._json(403, {"error": "Solo un propietario puede asignar roles."})
@@ -576,19 +626,60 @@ class Handler(BaseHTTPRequestHandler):
                 values.append(role)
                 fields.append("is_admin = ?")
                 values.append(1 if role in ("owner", "partner") else 0)
-            if not fields:
+            if not fields and new_name is None:
                 conn.close()
                 self._json(400, {"error": "Usuario o estado no válido."})
                 return
-            values.append(username)
-            conn.execute(
-                "UPDATE users SET %s WHERE username = ? COLLATE NOCASE" % ", ".join(fields),
-                values,
-            )
+            lookup = username
+            if fields:
+                values.append(username)
+                conn.execute(
+                    "UPDATE users SET %s WHERE username = ? COLLATE NOCASE" % ", ".join(fields),
+                    values,
+                )
+            if new_name is not None:
+                try:
+                    lookup = _rename_user(conn, target["username"], new_name)
+                except ValueError as exc:
+                    conn.close()
+                    self._json(409 if "ya existe" in str(exc) else 400, {"error": str(exc)})
+                    return
             conn.commit()
+            updated = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (lookup,)
+            ).fetchone()
             conn.close()
             persist()
-        self._json(200, {"ok": True})
+        payload = {"ok": True, "user": user_public(updated)}
+        if actor["username"].lower() == username.lower():
+            payload["token"] = _make_token(updated["username"])
+        self._json(200, payload)
+
+    def _rename_self(self, body):
+        actor = self._require_user()
+        if actor is None:
+            self._json(401, {"error": "Sesión caducada. Vuelve a iniciar sesión."})
+            return
+        try:
+            new_name = _validate_username(body.get("username"))
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        with _lock:
+            conn = db()
+            try:
+                lookup = _rename_user(conn, actor["username"], new_name)
+            except ValueError as exc:
+                conn.close()
+                self._json(409 if "ya existe" in str(exc) else 400, {"error": str(exc)})
+                return
+            conn.commit()
+            updated = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (lookup,)
+            ).fetchone()
+            conn.close()
+            persist()
+        self._json(200, {"ok": True, "user": user_public(updated), "token": _make_token(updated["username"])})
 
     def do_DELETE(self):
         path = self.path.split("?", 1)[0]
@@ -649,11 +740,12 @@ class Handler(BaseHTTPRequestHandler):
         if actor is None:
             self._json(403, {"error": "No tienes permiso para crear cuentas."})
             return
-        username = (body.get("username") or "").strip()
         email = (body.get("email") or "").strip()
         password = body.get("password") or ""
-        if len(username) < 3:
-            self._json(400, {"error": "El usuario debe tener al menos 3 caracteres."})
+        try:
+            username = _validate_username(body.get("username"))
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
             return
         if "@" not in email or len(email) < 6:
             self._json(400, {"error": "El correo no es válido."})
