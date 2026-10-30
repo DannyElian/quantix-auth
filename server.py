@@ -554,9 +554,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "JSON inválido."})
             return
-        if path == "/auth/me":
-            self._rename_self(body)
-            return
         if path != "/admin/users":
             self._json(404, {"error": "No encontrado."})
             return
@@ -585,6 +582,10 @@ class Handler(BaseHTTPRequestHandler):
             values = []
             new_name = None
             if body.get("newUsername") is not None:
+                if target["username"].lower() == actor["username"].lower():
+                    conn.close()
+                    self._json(403, {"error": "El nombre de usuario lo cambia el administrador."})
+                    return
                 try:
                     new_name = _validate_username(body.get("newUsername"))
                 except ValueError as exc:
@@ -650,36 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
             conn.close()
             persist()
-        payload = {"ok": True, "user": user_public(updated)}
-        if actor["username"].lower() == username.lower():
-            payload["token"] = _make_token(updated["username"])
-        self._json(200, payload)
-
-    def _rename_self(self, body):
-        actor = self._require_user()
-        if actor is None:
-            self._json(401, {"error": "Sesión caducada. Vuelve a iniciar sesión."})
-            return
-        try:
-            new_name = _validate_username(body.get("username"))
-        except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
-        with _lock:
-            conn = db()
-            try:
-                lookup = _rename_user(conn, actor["username"], new_name)
-            except ValueError as exc:
-                conn.close()
-                self._json(409 if "ya existe" in str(exc) else 400, {"error": str(exc)})
-                return
-            conn.commit()
-            updated = conn.execute(
-                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (lookup,)
-            ).fetchone()
-            conn.close()
-            persist()
-        self._json(200, {"ok": True, "user": user_public(updated), "token": _make_token(updated["username"])})
+        self._json(200, {"ok": True, "user": user_public(updated)})
 
     def do_DELETE(self):
         path = self.path.split("?", 1)[0]
